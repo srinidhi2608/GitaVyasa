@@ -27,7 +27,7 @@ from typing import Callable, Optional
 import requests
 
 from config import WIKISOURCE_API_URL, WIKISOURCE_SEARCH_LIMIT, DEFAULT_RATE_LIMIT_SECONDS
-from smart_search import SmartSearchEngine
+from smart_search import SmartSearchEngine, generate_query_variants
 
 try:
     from rapidfuzz import fuzz as _fuzz  # type: ignore
@@ -180,9 +180,13 @@ class WikisourceFetcher:
 
         Steps:
         1. Fetch raw search hits (with HTML snippets) from the Wikisource API.
-        2. Score every hit against *query* using RapidFuzz (if available).
-        3. Run SmartSearchEngine to identify the best semantic match; promote
-           it to the top of the list regardless of raw search rank.
+           If the initial search returns nothing, retry with generated spelling
+           variants (e.g. "shiva purana" → "siva purana").
+        2. Run SmartSearchEngine with a permissive threshold to identify the
+           best semantic match and promote it to the top of the list.
+        3. Include ALL remaining raw search hits sorted by fuzzy similarity —
+           no score-cutoff filter is applied here, so the user always sees
+           whatever Wikisource returned and can make the final call.
         4. Return up to *top_n* candidates, deduplicated.
 
         Parameters
@@ -192,14 +196,32 @@ class WikisourceFetcher:
         top_n : int
             Maximum number of candidates to return.
         score_threshold : float
-            Minimum fuzzy score (0–100) to include a search result.
+            Minimum fuzzy score used by SmartSearchEngine for best-match
+            promotion only.  Raw search results are never filtered by this
+            value so that the user always sees all available options.
         """
         raw_hits = self._search_with_snippets(query, limit=WIKISOURCE_SEARCH_LIMIT)
+
+        # Fallback: if Wikisource returns nothing for the original spelling,
+        # retry once with each generated variant (e.g. "siva purana").
+        if not raw_hits:
+            for variant in generate_query_variants(query)[1:]:  # skip original
+                alt_hits = self._search_with_snippets(variant, limit=WIKISOURCE_SEARCH_LIMIT)
+                if alt_hits:
+                    logger.info(
+                        "search_candidates: no results for '%s', using variant '%s'",
+                        query, variant,
+                    )
+                    raw_hits = alt_hits
+                    break
+
         titles = [h["title"] for h in raw_hits]
         snippet_map = {h["title"]: _clean_snippet(h.get("snippet", "")) for h in raw_hits}
 
-        # Smart-match: identify the best candidate across all tiers
-        engine = SmartSearchEngine(titles, score_threshold=score_threshold)
+        # Smart-match: identify the best candidate to promote to the top.
+        # Use a permissive threshold (max 40) so partial matches still rank
+        # first even if the user has set a strict sidebar threshold.
+        engine = SmartSearchEngine(titles, score_threshold=min(score_threshold, 40.0))
         best_match = engine.find_best_match(query)
 
         seen: set[str] = set()
@@ -222,7 +244,9 @@ class WikisourceFetcher:
             )
             seen.add(best_match.matched_title)
 
-        # Remaining search hits, scored and sorted by fuzzy similarity
+        # Include ALL remaining raw search hits sorted by fuzzy similarity.
+        # Intentionally no score-threshold filter: the user should always see
+        # everything Wikisource returned so they can choose the right page.
         scored_rest: list[tuple[str, float]] = []
         for title in titles:
             if title in seen:
@@ -232,8 +256,7 @@ class WikisourceFetcher:
                 if _RAPIDFUZZ_AVAILABLE
                 else 50.0
             )
-            if score >= score_threshold:
-                scored_rest.append((title, score))
+            scored_rest.append((title, score))
 
         scored_rest.sort(key=lambda x: x[1], reverse=True)
         for title, score in scored_rest:

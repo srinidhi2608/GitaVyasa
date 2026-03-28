@@ -104,6 +104,29 @@ def _phonetic_codes(text: str) -> tuple[str, str]:
     return (text, text)
 
 
+def generate_query_variants(query: str) -> list[str]:
+    """
+    Return all spelling variants of *query* that SmartSearchEngine would try
+    (aliases, normalised spellings).
+
+    Module-level convenience function — does not require a SmartSearchEngine
+    instance or a list of candidates.
+    """
+    variants: list[str] = [query]
+    # Alias lookup using the shared alias groups
+    ql = query.lower()
+    for group in _ALIAS_GROUPS:
+        for name in group:
+            if name.lower() == ql:
+                variants.extend(n for n in group if n != name)
+                break
+    # Normalised spelling variant
+    norm = _normalise(query)
+    if norm != query.lower():
+        variants.append(norm)
+    return list(dict.fromkeys(variants))  # deduplicate, preserve order
+
+
 @dataclass
 class MatchResult:
     """Represents the outcome of a smart-search lookup."""
@@ -204,12 +227,7 @@ class SmartSearchEngine:
 
     def generate_variants(self, query: str) -> list[str]:
         """Return all spelling variants of *query* that will be tried."""
-        variants = [query]
-        variants.extend(self._get_aliases(query))
-        norm = _normalise(query)
-        if norm != query.lower():
-            variants.append(norm)
-        return list(dict.fromkeys(variants))  # deduplicate preserving order
+        return generate_query_variants(query)
 
     # ------------------------------------------------------------------
     # Private helpers
