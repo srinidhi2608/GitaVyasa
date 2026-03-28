@@ -1,7 +1,20 @@
 # Configuration for GitaVyasa Project
 
+import os
+from pathlib import Path
+
 # Project Paths
-PROJECT_ROOT = '/path/to/gita_vyasa'
+PROJECT_ROOT = Path(__file__).parent
+
+# ---------------------------------------------------------------------------
+# Wikisource / Wikimedia API settings
+# ---------------------------------------------------------------------------
+WIKISOURCE_API_URL = "https://en.wikisource.org/w/api.php"
+WIKISOURCE_SEARCH_LIMIT = 20       # max candidates returned per search query
+DEFAULT_RATE_LIMIT_SECONDS = 1.0   # seconds between consecutive API calls
+
+# Local repository storage
+LOCAL_REPO_DIR = str(PROJECT_ROOT / "data" / "wikisource")
 
 # Bhagavad Gita Structure Constants
 TOTAL_CHAPTERS = 18
