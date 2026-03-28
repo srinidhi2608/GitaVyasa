@@ -15,9 +15,15 @@ the crawler will:
      pagination automatically.
   3. Fetch the raw wikitext for each content page and write it to:
          <output_dir>/<category_name>/<sanitised_page_title>.txt
-  4. Recurse into every sub-category (up to *max_depth* levels), creating
+  4. Parse every downloaded page's wikitext for internal ``[[...]]`` links
+     that point to sub-pages (titles containing ``/``).  Download those
+     sub-pages too — even if they are not tagged with the category — and
+     mirror the ``/`` hierarchy as nested directories under the parent.
+     This handles index/TOC pages whose sections (e.g. प्रश्नः १, २, ३)
+     are linked inside the wikitext but never added to the category.
+  5. Recurse into every sub-category (up to *max_depth* levels), creating
      nested sub-directories that mirror the category hierarchy.
-  5. Write an ``index.json`` summary at the category root directory.
+  6. Write an ``index.json`` summary at the category root directory.
 
 Usage
 -----
@@ -92,6 +98,28 @@ _SESSION.headers.update({
 _UNSAFE_FILENAME_RE = re.compile(r"[^\-\w\u0900-\u097F]")
 _MAX_FILENAME_LEN = 200
 
+# ---------------------------------------------------------------------------
+# Wikitext link extraction
+# ---------------------------------------------------------------------------
+# Matches [[target]] and [[target|display text]] wiki links.
+_WIKI_LINK_RE = re.compile(r"\[\[([^\[\]|]+?)(?:\|[^\[\]]*)?\]\]")
+
+# Namespace prefixes (Sanskrit and English) that signal a non-content page.
+# Links whose title begins with one of these followed by ":" are skipped.
+_SKIP_NS_PREFIXES: frozenset[str] = frozenset([
+    # Sanskrit Wikisource namespaces
+    "वर्गः",       # Category
+    "वार्ता",       # Talk
+    "सदस्यः",      # User
+    "चित्रम्",      # File / Image
+    "साहाय्यम्",   # Help
+    "विकिस्रोतः",  # Wikisource project
+    # English equivalents used on multilingual installations
+    "Category", "Talk", "User", "File", "Image", "Help",
+    "Wikisource", "Wikipedia", "MediaWiki", "Template", "Module", "Portal",
+    "User talk", "File talk", "Template talk", "Category talk",
+])
+
 
 def _sanitise_filename(name: str) -> str:
     """Convert *name* into a safe file or directory name on any OS.
@@ -103,6 +131,57 @@ def _sanitise_filename(name: str) -> str:
     name = _UNSAFE_FILENAME_RE.sub("_", name)
     name = re.sub(r"_+", "_", name).strip("_")
     return name[:_MAX_FILENAME_LEN] or "unknown"
+
+
+def _extract_wikitext_links(wikitext: str, base_title: str = "") -> list[str]:
+    """Extract navigable internal page links from *wikitext*.
+
+    Returns a deduplicated list of page titles to follow, in order of first
+    appearance.  Category links, file embeds, and section anchors are
+    excluded.
+
+    If *base_title* is supplied, MediaWiki relative sub-page links that start
+    with ``/`` are resolved against the root of *base_title*:
+
+        ``/प्रश्नः १``  +  ``आग्निवेश्यगृह्यसूत्रम्``
+        →  ``आग्निवेश्यगृह्यसूत्रम्/प्रश्नः १``
+    """
+    seen: set[str] = set()
+    titles: list[str] = []
+    # Root of the current page title (part before the first "/")
+    base_root = base_title.split("/")[0] if base_title else ""
+
+    for m in _WIKI_LINK_RE.finditer(wikitext):
+        raw = m.group(1).strip()
+
+        # Skip pure section anchors
+        if raw.startswith("#"):
+            continue
+
+        # Resolve relative sub-page links (e.g. /प्रश्नः १ → Parent/प्रश्नः १)
+        if raw.startswith("/"):
+            if base_root:
+                raw = base_root + raw
+            else:
+                continue
+
+        # Strip explicit main-namespace prefix (":Page" → "Page")
+        if raw.startswith(":"):
+            raw = raw[1:].strip()
+
+        # Skip known non-content namespaces
+        colon_pos = raw.find(":")
+        if colon_pos > 0 and raw[:colon_pos].strip() in _SKIP_NS_PREFIXES:
+            continue
+
+        if not raw or raw == base_title:
+            continue
+
+        if raw not in seen:
+            seen.add(raw)
+            titles.append(raw)
+
+    return titles
 
 
 # ---------------------------------------------------------------------------
@@ -236,12 +315,14 @@ class SanskritWikisourceBatch:
         root_dir = self.output_dir / _sanitise_filename(category_name)
 
         visited_categories: set[str] = set()
+        visited_pages: set[str] = set()
         self._crawl_category(
             category_title=category_title,
             current_dir=root_dir,
             depth=0,
             result=result,
             visited=visited_categories,
+            visited_pages=visited_pages,
             progress_callback=progress_callback,
         )
 
@@ -375,6 +456,7 @@ class SanskritWikisourceBatch:
         depth: int,
         result: BatchResult,
         visited: set[str],
+        visited_pages: set[str],
         progress_callback: Optional[Callable[[DownloadedPage], None]],
     ) -> None:
         """Recursively crawl *category_title* and save all content pages."""
@@ -410,13 +492,29 @@ class SanskritWikisourceBatch:
                     depth=depth + 1,
                     result=result,
                     visited=visited,
+                    visited_pages=visited_pages,
                     progress_callback=progress_callback,
                 )
             else:
+                if member.title in visited_pages:
+                    logger.debug("Skipping already-visited page '%s'", member.title)
+                    continue
+                visited_pages.add(member.title)
                 downloaded = self._fetch_and_save(member, current_dir)
                 result.pages.append(downloaded)
                 if progress_callback:
                     progress_callback(downloaded)
+                # Follow any sub-page links embedded in this page's wikitext.
+                if downloaded.success:
+                    self._crawl_page_links(
+                        parent_title=member.title,
+                        wikitext=downloaded.content,
+                        output_dir=current_dir,
+                        depth=depth + 1,
+                        result=result,
+                        visited_pages=visited_pages,
+                        progress_callback=progress_callback,
+                    )
 
     def _fetch_and_save(self, member: PageMember, output_dir: Path) -> DownloadedPage:
         """Fetch *member*'s wikitext and write it to *output_dir*."""
@@ -451,6 +549,117 @@ class SanskritWikisourceBatch:
             output_path=str(output_path),
             success=True,
         )
+
+    def _resolve_output_path(self, title: str, base_dir: Path) -> Path:
+        """Map a page *title* to a filesystem path under *base_dir*.
+
+        MediaWiki sub-page separators (``/``) are reflected as nested
+        directories so that the on-disk layout mirrors the page hierarchy:
+
+        .. code-block:: text
+
+            "A"         →  base_dir/A.txt
+            "A/B"       →  base_dir/A/B.txt
+            "A/B/C"     →  base_dir/A/B/C.txt
+        """
+        parts = [_sanitise_filename(p) for p in title.split("/") if p.strip()]
+        if not parts:
+            return base_dir / "unknown.txt"
+        if len(parts) == 1:
+            return base_dir / (parts[0] + ".txt")
+        return base_dir.joinpath(*parts[:-1]) / (parts[-1] + ".txt")
+
+    def _crawl_page_links(
+        self,
+        parent_title: str,
+        wikitext: str,
+        output_dir: Path,
+        depth: int,
+        result: BatchResult,
+        visited_pages: set[str],
+        progress_callback: Optional[Callable[[DownloadedPage], None]],
+    ) -> None:
+        """Parse *wikitext* for ``[[...]]`` links and download any sub-pages.
+
+        Only links whose titles contain ``/`` are followed — these are
+        MediaWiki sub-pages (e.g. ``आग्निवेश्यगृह्यसूत्रम्/प्रश्नः २``)
+        that act as sub-sections of the parent page.  Pages already in
+        *visited_pages* are skipped, preventing duplicate downloads.
+
+        Sub-pages are saved under *output_dir* using
+        :meth:`_resolve_output_path` so the ``/`` hierarchy is reflected
+        as nested directories.
+        """
+        if depth > self.max_depth:
+            logger.warning(
+                "Max recursion depth %d reached while following links from '%s' — stopping",
+                self.max_depth,
+                parent_title,
+            )
+            return
+
+        all_links = _extract_wikitext_links(wikitext, base_title=parent_title)
+        # Pre-filter: skip non-sub-page links and pages already known to be
+        # visited.  The inner check at the top of the loop (line below) is the
+        # authoritative guard; this pre-filter just avoids building an inflated
+        # log count and iterating links that were already visited before this
+        # call started.
+        new_links = [t for t in all_links if "/" in t and t not in visited_pages]
+
+        if not new_links:
+            return
+
+        logger.info(
+            "[link-follow depth=%d] '%s': %d sub-page link(s)",
+            depth, parent_title, len(new_links),
+        )
+
+        for linked_title in new_links:
+            if linked_title in visited_pages:
+                continue
+            visited_pages.add(linked_title)
+
+            output_path = self._resolve_output_path(linked_title, output_dir)
+            logger.info("[link-follow] Fetching: '%s'", linked_title)
+
+            content, linked_url = self.fetch_page_text(linked_title)
+
+            if content is not None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(content, encoding="utf-8")
+                logger.info("[link-follow] Saved '%s' → %s", linked_title, output_path)
+                downloaded = DownloadedPage(
+                    title=linked_title,
+                    url=linked_url,
+                    content=content,
+                    output_path=str(output_path),
+                    success=True,
+                )
+            else:
+                downloaded = DownloadedPage(
+                    title=linked_title,
+                    url=linked_url,
+                    content="",
+                    output_path=str(output_path),
+                    success=False,
+                    error=f"Content could not be retrieved for '{linked_title}'",
+                )
+
+            result.pages.append(downloaded)
+            if progress_callback:
+                progress_callback(downloaded)
+
+            # Recurse into this page's own sub-links
+            if downloaded.success:
+                self._crawl_page_links(
+                    parent_title=linked_title,
+                    wikitext=downloaded.content,
+                    output_dir=output_dir,
+                    depth=depth + 1,
+                    result=result,
+                    visited_pages=visited_pages,
+                    progress_callback=progress_callback,
+                )
 
     def _write_index(self, result: BatchResult, root_dir: Path) -> None:
         """Write an ``index.json`` summary of all download attempts to *root_dir*."""
