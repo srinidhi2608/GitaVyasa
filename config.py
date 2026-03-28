@@ -13,6 +13,12 @@ WIKISOURCE_API_URL = "https://en.wikisource.org/w/api.php"
 WIKISOURCE_SEARCH_LIMIT = 20       # max candidates returned per search query
 DEFAULT_RATE_LIMIT_SECONDS = 1.0   # seconds between consecutive API calls
 
+# Sanskrit Wikisource (sa.wikisource.org) settings
+SA_WIKISOURCE_API_URL = "https://sa.wikisource.org/w/api.php"
+SA_WIKISOURCE_BASE_URL = "https://sa.wikisource.org/wiki/"
+SA_WIKISOURCE_CATEGORY_LIMIT = 500  # max members per categorymembers API call
+SA_LOCAL_REPO_DIR = str(PROJECT_ROOT / "data" / "sa_wikisource")
+
 # Local repository storage
 LOCAL_REPO_DIR = str(PROJECT_ROOT / "data" / "wikisource")
 
