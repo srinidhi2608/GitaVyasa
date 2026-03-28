@@ -42,16 +42,26 @@ Open the URL shown in the terminal (usually `http://localhost:8501`).
 
 ## Using the Wikisource Extractor
 
+The extractor uses a **three-phase workflow** that gives you full control before any download starts:
+
+### Phase 1 — Find Matches
 1. Enter comma-separated source names in the text area, e.g.:
    ```
    Bhagavad Gita, Mahabharata, Shiva Purana, Ramayana, Upanishads
    ```
 2. Adjust the sidebar settings (rate-limit, timeout, fuzzy-match threshold).
-3. Click **▶ Extract**.
-4. Watch the real-time progress bar and log panel.
-   - The log shows exactly which alternate spellings were tried when an exact match failed.
-5. Review the success/failure summary table.
-6. Download the full index as CSV with the **⬇️ Download** button.
+3. Click **🔍 Find Matches** — the app queries Wikisource and ranks candidates for every source name.  No content is downloaded yet.
+
+### Phase 2 — Review & Select
+4. For each query a two-column panel appears:
+   - **Left column** — a radio group listing the top candidate page titles, each labelled with a confidence badge and match type (Exact · Alias · Phonetic · Fuzzy).
+   - **Right column** — a live preview card that updates instantly when you click a radio option, showing the Wikisource text snippet (with highlighted match terms), the page URL, and confidence score.  Click the **🔗 Open in Wikisource** link to inspect the full page in your browser.
+5. Choose the correct match for each source, then click **⬇️ Download Selected**.
+
+### Phase 3 — Download & Summary
+6. Only the confirmed titles are downloaded.  A real-time progress bar and log console show each title as it is fetched.
+7. A summary table at the end lists success/failure for every item.
+8. Click **⬇️ Download full index as CSV** to export the index, or **🔄 Start New Search** to begin again.
 
 Downloaded texts are saved to `data/wikisource/<title>/`:
 ```

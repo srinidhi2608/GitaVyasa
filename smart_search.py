@@ -184,7 +184,9 @@ class SmartSearchEngine:
             for title in self.candidates:
                 if _soundex(title) == soundex_query or _metaphone(title) == meta_query:
                     logger.info("[smart_search] Phonetic match: '%s'", title)
-                    return MatchResult(query, title, "phonetic", 80.0, tried)        # 5. Fuzzy match
+                    return MatchResult(query, title, "phonetic", 80.0, tried)
+
+        # 5. Fuzzy match
         if _RAPIDFUZZ_AVAILABLE and self.candidates:
             best = rf_process.extractOne(
                 query,

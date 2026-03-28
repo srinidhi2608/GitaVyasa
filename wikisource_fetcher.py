@@ -19,6 +19,7 @@ WikisourceFetcher(rate_limit_seconds=1.0, timeout=15)
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -28,12 +29,40 @@ import requests
 from config import WIKISOURCE_API_URL, WIKISOURCE_SEARCH_LIMIT, DEFAULT_RATE_LIMIT_SECONDS
 from smart_search import SmartSearchEngine
 
+try:
+    from rapidfuzz import fuzz as _fuzz  # type: ignore
+    _RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    _RAPIDFUZZ_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 _SESSION = requests.Session()
 _SESSION.headers.update({
     "User-Agent": "GitaVyasa/1.0 (https://github.com/srinidhi2608/GitaVyasa; educational-use) python-requests"
 })
+
+_SNIPPET_ALLOWED_RE = re.compile(r"<(?!/?span\b)[^>]+>")
+
+
+def _clean_snippet(html: str) -> str:
+    """
+    Lightly sanitise a Wikisource search snippet for display.
+
+    Keeps <span class="searchmatch"> tags (used for highlighting) and strips
+    everything else.
+    """
+    return _SNIPPET_ALLOWED_RE.sub("", html).strip()
+
+
+@dataclass
+class CandidateInfo:
+    """A single ranked match candidate for a user query, ready for UI display."""
+    title: str
+    snippet: str        # sanitised HTML excerpt from Wikisource search
+    url: str            # canonical Wikisource page URL
+    match_method: str   # "exact" | "alias" | "normalised" | "phonetic" | "fuzzy" | "search"
+    match_score: float  # 0–100
 
 
 @dataclass
@@ -81,20 +110,7 @@ class WikisourceFetcher:
 
         Returns a list of page titles matching *query*.
         """
-        params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": query,
-            "srnamespace": "0",
-            "srlimit": str(limit),
-            "format": "json",
-        }
-        try:
-            data = self._get(WIKISOURCE_API_URL, params)
-            return [item["title"] for item in data.get("query", {}).get("search", [])]
-        except Exception as exc:
-            logger.warning("search_titles failed for '%s': %s", query, exc)
-            return []
+        return [h["title"] for h in self._search_with_snippets(query, limit=limit)]
 
     def fetch_page(self, query: str) -> PageResult:
         """
@@ -153,6 +169,114 @@ class WikisourceFetcher:
             success=True,
         )
 
+    def search_candidates(
+        self,
+        query: str,
+        top_n: int = 6,
+        score_threshold: float = 40.0,
+    ) -> list[CandidateInfo]:
+        """
+        Return a ranked list of Wikisource page candidates for *query*.
+
+        Steps:
+        1. Fetch raw search hits (with HTML snippets) from the Wikisource API.
+        2. Score every hit against *query* using RapidFuzz (if available).
+        3. Run SmartSearchEngine to identify the best semantic match; promote
+           it to the top of the list regardless of raw search rank.
+        4. Return up to *top_n* candidates, deduplicated.
+
+        Parameters
+        ----------
+        query : str
+            The user's original (possibly variant-spelled) query.
+        top_n : int
+            Maximum number of candidates to return.
+        score_threshold : float
+            Minimum fuzzy score (0–100) to include a search result.
+        """
+        raw_hits = self._search_with_snippets(query, limit=WIKISOURCE_SEARCH_LIMIT)
+        titles = [h["title"] for h in raw_hits]
+        snippet_map = {h["title"]: _clean_snippet(h.get("snippet", "")) for h in raw_hits}
+
+        # Smart-match: identify the best candidate across all tiers
+        engine = SmartSearchEngine(titles, score_threshold=score_threshold)
+        best_match = engine.find_best_match(query)
+
+        seen: set[str] = set()
+        candidates: list[CandidateInfo] = []
+
+        def _make_candidate(title: str, method: str, score: float) -> CandidateInfo:
+            url = f"https://en.wikisource.org/wiki/{title.replace(' ', '_')}"
+            return CandidateInfo(
+                title=title,
+                snippet=snippet_map.get(title, ""),
+                url=url,
+                match_method=method,
+                match_score=score,
+            )
+
+        # Best smart-search match goes first
+        if best_match and best_match.matched_title not in seen:
+            candidates.append(
+                _make_candidate(best_match.matched_title, best_match.method, best_match.score)
+            )
+            seen.add(best_match.matched_title)
+
+        # Remaining search hits, scored and sorted by fuzzy similarity
+        scored_rest: list[tuple[str, float]] = []
+        for title in titles:
+            if title in seen:
+                continue
+            score = (
+                _fuzz.token_sort_ratio(query, title)
+                if _RAPIDFUZZ_AVAILABLE
+                else 50.0
+            )
+            if score >= score_threshold:
+                scored_rest.append((title, score))
+
+        scored_rest.sort(key=lambda x: x[1], reverse=True)
+        for title, score in scored_rest:
+            if len(candidates) >= top_n:
+                break
+            candidates.append(_make_candidate(title, "search", score))
+            seen.add(title)
+
+        return candidates[:top_n]
+
+    def fetch_page_by_title(self, query: str, title: str) -> PageResult:
+        """
+        Fetch the wikitext for a *title* explicitly chosen by the user.
+
+        This skips the search / smart-match phase and goes straight to
+        content retrieval, so it is suitable for the download phase after
+        the user has confirmed their selection.
+        """
+        logger.info("Fetching user-selected page: '%s' (query='%s')", title, query)
+        content, url = self._fetch_wikitext(title)
+        if content is None:
+            return PageResult(
+                query=query,
+                title=title,
+                url=url,
+                content="",
+                match_method="user_selected",
+                match_score=100.0,
+                tried_variants=[title],
+                success=False,
+                error=f"Page '{title}' content could not be retrieved",
+            )
+        return PageResult(
+            query=query,
+            title=title,
+            url=url,
+            content=content,
+            match_method="user_selected",
+            match_score=100.0,
+            tried_variants=[title],
+            success=True,
+        )
+
     def fetch_bulk(
         self,
         queries: list[str],
@@ -185,6 +309,27 @@ class WikisourceFetcher:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _search_with_snippets(self, query: str, limit: int = WIKISOURCE_SEARCH_LIMIT) -> list[dict]:
+        """
+        Query the Wikisource search API and return raw hit dicts, each
+        containing at minimum ``title`` and ``snippet`` keys.
+        """
+        params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "srnamespace": "0",
+            "srlimit": str(limit),
+            "srprop": "snippet|titlesnippet",
+            "format": "json",
+        }
+        try:
+            data = self._get(WIKISOURCE_API_URL, params)
+            return data.get("query", {}).get("search", [])
+        except Exception as exc:
+            logger.warning("_search_with_snippets failed for '%s': %s", query, exc)
+            return []
 
     def _throttle(self) -> None:
         """Enforce the rate limit between API calls."""
