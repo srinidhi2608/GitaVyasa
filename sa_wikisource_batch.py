@@ -24,6 +24,15 @@ the crawler will:
   5. Recurse into every sub-category (up to *max_depth* levels), creating
      nested sub-directories that mirror the category hierarchy.
   6. Write an ``index.json`` summary at the category root directory.
+  7. Write a timestamped per-run log file under
+         <output_dir>/logs/run_<YYYYMMDDTHHMMSS>_<category>.log
+     recording SUCCESS / FAILURE for every page, including the exact URL
+     and saved file path on success, or the error message on failure.
+  8. After the full crawl, create a concatenated ``<dirname>.txt`` file
+     adjacent to every directory so each category/sub-category can be
+     read as a single text file.  Processing is bottom-up so a parent's
+     concat file automatically includes the children's already-merged
+     content.
 
 Usage
 -----
@@ -58,12 +67,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, IO, Optional
 from urllib.parse import unquote, urlparse
 
 import requests
@@ -80,6 +90,9 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 15
 _DEFAULT_MAX_DEPTH = 10
+
+# Width of the ``=`` separator banners used in concatenated output files.
+_CONCAT_BANNER_WIDTH = 60
 
 # Shared HTTP session — User-Agent is required by Wikimedia's API policy.
 _SESSION = requests.Session()
@@ -214,6 +227,7 @@ class BatchResult:
     category_url: str
     output_dir: str
     pages: list[DownloadedPage] = field(default_factory=list)
+    log_path: str = ""
 
     @property
     def success_count(self) -> int:
@@ -263,6 +277,8 @@ class SanskritWikisourceBatch:
         self.timeout = timeout
         self.max_depth = max_depth
         self._last_request_time: float = 0.0
+        # Set to an open file handle during run(); None otherwise.
+        self._run_log: Optional[IO[str]] = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -314,17 +330,50 @@ class SanskritWikisourceBatch:
         category_name = category_title.split(":", 1)[-1]
         root_dir = self.output_dir / _sanitise_filename(category_name)
 
+        # -----------------------------------------------------------------
+        # Open a timestamped per-run log file.
+        # -----------------------------------------------------------------
+        log_dir = self.output_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        run_ts = datetime.now(timezone.utc)
+        log_filename = (
+            f"run_{run_ts.strftime('%Y%m%d_%H%M%S')}"
+            f"_{_sanitise_filename(category_name)}.log"
+        )
+        log_path = log_dir / log_filename
+        log_file = log_path.open("w", encoding="utf-8")
+        self._run_log = log_file
+        log_file.write(
+            f"Run started : {run_ts.isoformat()}\n"
+            f"Category    : {category_url}\n"
+            f"Output dir  : {self.output_dir}\n"
+            f"{'-' * 72}\n\n"
+        )
+        log_file.flush()
+
         visited_categories: set[str] = set()
         visited_pages: set[str] = set()
-        self._crawl_category(
-            category_title=category_title,
-            current_dir=root_dir,
-            depth=0,
-            result=result,
-            visited=visited_categories,
-            visited_pages=visited_pages,
-            progress_callback=progress_callback,
-        )
+        try:
+            self._crawl_category(
+                category_title=category_title,
+                current_dir=root_dir,
+                depth=0,
+                result=result,
+                visited=visited_categories,
+                visited_pages=visited_pages,
+                progress_callback=progress_callback,
+            )
+        finally:
+            end_ts = datetime.now(timezone.utc)
+            log_file.write(
+                f"\n{'-' * 72}\n"
+                f"Run ended   : {end_ts.isoformat()}\n"
+                f"Total       : {result.total_count}\n"
+                f"Succeeded   : {result.success_count}\n"
+                f"Failed      : {result.failure_count}\n"
+            )
+            log_file.close()
+            self._run_log = None
 
         logger.info(
             "Batch complete: %d downloaded, %d failed (total %d)",
@@ -332,7 +381,10 @@ class SanskritWikisourceBatch:
             result.failure_count,
             result.total_count,
         )
+        result.log_path = str(log_path)
+        logger.info("Run log written to %s", log_path)
         self._write_index(result, root_dir)
+        self._write_concat_files(root_dir)
         return result
 
     def list_category_pages(self, category_title: str) -> list[PageMember]:
@@ -502,6 +554,7 @@ class SanskritWikisourceBatch:
                 visited_pages.add(member.title)
                 downloaded = self._fetch_and_save(member, current_dir)
                 result.pages.append(downloaded)
+                self._log_page_result(downloaded)
                 if progress_callback:
                     progress_callback(downloaded)
                 # Follow any sub-page links embedded in this page's wikitext.
@@ -646,6 +699,7 @@ class SanskritWikisourceBatch:
                 )
 
             result.pages.append(downloaded)
+            self._log_page_result(downloaded)
             if progress_callback:
                 progress_callback(downloaded)
 
@@ -660,6 +714,67 @@ class SanskritWikisourceBatch:
                     visited_pages=visited_pages,
                     progress_callback=progress_callback,
                 )
+
+    def _log_page_result(self, page: DownloadedPage) -> None:
+        """Append one SUCCESS or FAILURE line to the active run log file.
+
+        Does nothing when called outside of a :meth:`run` invocation (i.e.
+        when :attr:`_run_log` is ``None``).
+        """
+        if self._run_log is None:
+            return
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if page.success:
+            line = (
+                f"[{ts}] SUCCESS"
+                f" | {page.title}"
+                f" | URL: {page.url}"
+                f" | File: {page.output_path}\n"
+            )
+        else:
+            line = (
+                f"[{ts}] FAILURE"
+                f" | {page.title}"
+                f" | URL: {page.url}"
+                f" | Error: {page.error}\n"
+            )
+        self._run_log.write(line)
+        self._run_log.flush()
+
+    def _write_concat_files(self, root_dir: Path) -> None:
+        """Create a ``<dirname>.txt`` file adjacent to every directory under
+        *root_dir* (including *root_dir* itself).
+
+        The file concatenates all direct-child ``.txt`` files of that
+        directory, separated by a banner showing each file's stem.
+        Processing is **bottom-up** (``os.walk`` with ``topdown=False``) so
+        that by the time a parent directory is processed, any concat files
+        already written for its sub-directories are present among the parent's
+        direct children and are naturally included in the parent's concat.
+
+        ``index.json`` and other non-``.txt`` files are ignored.
+        """
+        concat_count = 0
+        for dirpath, _dirs, files in os.walk(str(root_dir), topdown=False):
+            dp = Path(dirpath)
+            txt_files = sorted(dp / f for f in files if f.endswith(".txt"))
+            if not txt_files:
+                continue
+            target = dp.parent / (dp.name + ".txt")
+            chunks: list[str] = []
+            for txt_path in txt_files:
+                header = (
+                    f"{'=' * _CONCAT_BANNER_WIDTH}\n"
+                    f"{txt_path.stem}\n"
+                    f"{'=' * _CONCAT_BANNER_WIDTH}"
+                )
+                chunks.append(f"{header}\n{txt_path.read_text(encoding='utf-8')}")
+            target.write_text("\n\n".join(chunks), encoding="utf-8")
+            logger.info(
+                "Concat → %s (%d source file(s))", target, len(txt_files)
+            )
+            concat_count += 1
+        logger.info("Concat files written: %d", concat_count)
 
     def _write_index(self, result: BatchResult, root_dir: Path) -> None:
         """Write an ``index.json`` summary of all download attempts to *root_dir*."""
@@ -811,6 +926,7 @@ def main() -> None:
     print(f"❌  Failed     : {result.failure_count}")
     print(f"📄  Total      : {result.total_count}")
     print(f"📂  Saved to   : {result.output_dir}")
+    print(f"📋  Run log    : {result.log_path}")
 
 
 if __name__ == "__main__":
