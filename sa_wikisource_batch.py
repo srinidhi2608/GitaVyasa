@@ -742,20 +742,32 @@ class SanskritWikisourceBatch:
         self._run_log.flush()
 
     def _write_concat_files(self, root_dir: Path) -> None:
-        """Create a ``<dirname>.txt`` file adjacent to every directory under
-        *root_dir* (including *root_dir* itself).
+        """Create a ``<dirname>.txt`` file adjacent to a directory **only**
+        when that directory contains exclusively ``.txt`` files (no
+        sub-directories).  Directories that contain sub-directories are
+        skipped — the intent is to keep each book's individual section files
+        together in one place without creating spurious roll-ups at higher
+        levels of the hierarchy.
 
-        The file concatenates all direct-child ``.txt`` files of that
-        directory, separated by a banner showing each file's stem.
-        Processing is **bottom-up** (``os.walk`` with ``topdown=False``) so
-        that by the time a parent directory is processed, any concat files
-        already written for its sub-directories are present among the parent's
-        direct children and are naturally included in the parent's concat.
+        Example::
+
+            गृह्यसूत्रम्/
+              आपस्तम्बगृह्यसूत्रम्.txt     ← direct .txt file, no sub-dirs
+              आग्निवेश्यगृह्यसूत्रम्/       ← sub-directory with sections
+                प्रश्नः_१.txt
+                प्रश्नः_२.txt
+
+        Only ``आग्निवेश्यगृह्यसूत्रम्/`` qualifies (no sub-dirs inside it).
+        The result is ``गृह्यसूत्रम्/आग्निवेश्यगृह्यसूत्रम्.txt``.
+        ``गृह्यसूत्रम्/`` itself is skipped because it has a sub-directory.
 
         ``index.json`` and other non-``.txt`` files are ignored.
         """
         concat_count = 0
-        for dirpath, _dirs, files in os.walk(str(root_dir), topdown=False):
+        for dirpath, dirs, files in os.walk(str(root_dir)):
+            # Skip directories that contain sub-directories.
+            if dirs:
+                continue
             dp = Path(dirpath)
             txt_files = sorted(dp / f for f in files if f.endswith(".txt"))
             if not txt_files:
